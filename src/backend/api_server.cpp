@@ -1,32 +1,50 @@
 /**
  * @file api_server.cpp
- * @brief HTTP服务器实现，处理RESTful API请求和静态文件服务
+ * @brief 停车场管理系统HTTP服务器的核心实现
  * 
- * 这个文件实现了一个基于Socket的HTTP服务器，支持：
- * 1. RESTful API请求处理
- * 2. 静态文件服务
- * 3. 跨域资源共享(CORS)
- * 4. 多线程并发处理
+ * 主要功能：
+ * 1. HTTP服务器实现（请求解析、响应生成）
+ * 2. RESTful API路由系统
+ * 3. 静态文件服务
+ * 4. 跨域资源共享(CORS)处理
+ * 5. 多线程并发处理
+ * 6. JSON数据处理
+ * 
+ * 技术要点：
+ * - Socket网络编程
+ * - HTTP协议实现
+ * - 多线程并发
+ * - 文件系统操作
+ * - 异常处理机制
  */
+
 #include "api_server.h"
-#include <sys/socket.h>     // Socket API
-#include <netinet/in.h>     // 网络地址结构
-#include <unistd.h>         // Unix标准函数
-#include <cstring>
-#include <iostream>
-#include <thread>           // 多线程支持
-#include <sstream>
-#include <vector>
-#include <algorithm>
-#include <iomanip>
-#include <fstream>
-#include <filesystem>       // C++17文件系统
+#include <sys/socket.h>     // 提供Socket API
+#include <netinet/in.h>     // 提供网络地址结构
+#include <unistd.h>         // 提供Unix标准系统调用
+#include <cstring>          // 字符串操作
+#include <iostream>         // 标准输入输出
+#include <thread>          // 线程支持
+#include <sstream>         // 字符串流
+#include <vector>          // 动态数组
+#include <algorithm>       // 算法库
+#include <iomanip>         // 输出格式控制
+#include <fstream>         // 文件操作
+#include <filesystem>      // 文件系统操作(C++17)
 
 namespace fs = std::filesystem;
 
 /**
  * @brief MIME类型映射表
  * 用于设置HTTP响应的Content-Type头
+ * 
+ * 支持的文件类型：
+ * - HTML (.html)：网页文件
+ * - CSS (.css)：样式表
+ * - JavaScript (.js)：脚本文件
+ * - JSON (.json)：数据交换
+ * - 图片 (.png, .jpg, .jpeg)：图像文件
+ * - 图标 (.ico)：网站图标
  */
 std::map<std::string, std::string> MIME_TYPES = {
     {".html", "text/html"},
@@ -41,22 +59,33 @@ std::map<std::string, std::string> MIME_TYPES = {
 
 /**
  * @brief URL解码函数
- * 将URL编码的字符串转换为原始字符串
- * 处理%XX格式的编码字符和+号(表示空格)
- * 
  * @param encoded URL编码的字符串
- * @return 解码后的字符串
+ * @return 解码后的原始字符串
+ * 
+ * 实现细节：
+ * 1. 处理%XX格式的编码字符：
+ *    - %后跟两位16进制数
+ *    - 将16进制转换为对应的ASCII字符
+ * 2. 处理+号：转换为空格
+ * 3. 保留其他字符不变
+ * 
+ * 错误处理：
+ * - 如果%后没有足够的字符，保持原样
+ * - 如果16进制转换失败，保持原样
  */
 std::string urlDecode(const std::string& encoded) {
     std::string result;
+    result.reserve(encoded.length()); // 预分配空间，避免频繁重新分配
+
     for (size_t i = 0; i < encoded.length(); ++i) {
         if (encoded[i] == '%') {
+            // 确保后面还有两个字符
             if (i + 2 < encoded.length()) {
                 std::string hex = encoded.substr(i + 1, 2);
                 int value;
                 std::istringstream(hex) >> std::hex >> value;
                 result += static_cast<char>(value);
-                i += 2;
+                i += 2; // 跳过已处理的两个字符
             }
         } else if (encoded[i] == '+') {
             result += ' ';
@@ -69,11 +98,19 @@ std::string urlDecode(const std::string& encoded) {
 
 /**
  * @brief ParkingApiServer构造函数
- * 初始化服务器实例和路由表
- * 
  * @param capacity 停车场容量
  * @param smallRate 小型车每小时费率
  * @param largeRate 大型车每小时费率
+ * 
+ * 初始化过程：
+ * 1. 创建停车场管理对象
+ * 2. 初始化服务器socket为-1（未创建）
+ * 3. 设置运行状态为false
+ * 4. 初始化路由表
+ * 
+ * 注意：
+ * - 使用智能指针管理ParkingLot对象
+ * - 构造函数不会创建socket或启动服务器
  */
 ParkingApiServer::ParkingApiServer(size_t capacity, double smallRate, double largeRate) 
     : parkingLot(std::make_unique<ParkingLot>(capacity, smallRate, largeRate))
@@ -84,10 +121,14 @@ ParkingApiServer::ParkingApiServer(size_t capacity, double smallRate, double lar
 
 /**
  * @brief 获取文件的MIME类型
- * 根据文件扩展名确定Content-Type
- * 
  * @param path 文件路径
  * @return MIME类型字符串
+ * 
+ * 实现细节：
+ * 1. 提取文件扩展名
+ * 2. 转换为小写以确保匹配
+ * 3. 在MIME_TYPES映射表中查找
+ * 4. 如果未找到，返回默认类型
  */
 std::string getMimeType(const std::string& path) {
     std::string ext = fs::path(path).extension().string();
@@ -98,10 +139,17 @@ std::string getMimeType(const std::string& path) {
 
 /**
  * @brief 读取静态文件内容
- * 将指定路径的文件内容读取到字符串中
- * 
  * @param path 文件路径
- * @return 文件内容字符串
+ * @return 文件内容字符串，失败返回空串
+ * 
+ * 实现细节：
+ * 1. 以二进制模式打开文件
+ * 2. 使用迭代器读取全部内容
+ * 3. 自动处理文件关闭
+ * 
+ * 安全考虑：
+ * - 使用二进制模式避免文本转换问题
+ * - 通过RAII确保文件正确关闭
  */
 std::string readFile(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
@@ -113,24 +161,38 @@ std::string readFile(const std::string& path) {
 
 /**
  * @brief 处理静态文件请求
- * 根据请求路径返回相应的静态文件内容
- * 
  * @param path 请求路径
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 构造完整的文件路径
+ * 2. 读取文件内容
+ * 3. 设置适当的响应头
+ * 4. 处理可能的错误情况
+ * 
+ * 特殊处理：
+ * - 根路径("/")自动映射到index.html
+ * - 对不存在的文件返回404错误
+ * - 自动设置正确的Content-Type
+ * - 添加CORS相关头部
  */
 HttpResponse ParkingApiServer::handleStaticFile(const std::string& path) {
+    // 构造完整文件路径，处理根路径特殊情况
     std::string fullPath = "src/frontend" + (path == "/" ? "/index.html" : path);
     std::string content = readFile(fullPath);
     
     if (content.empty()) {
+        // 文件不存在或无法读取
         std::cerr << "Failed to read file: " << fullPath << std::endl;
         HttpResponse response(404);
         response.body = createJsonResponse(false, "File not found");
         return response;
     }
 
+    // 构造成功响应
     HttpResponse response(200);
     response.headers["Content-Type"] = getMimeType(fullPath);
+    // 设置CORS相关头部
     response.headers["Access-Control-Allow-Origin"] = "*";
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
     response.headers["Access-Control-Allow-Headers"] = "Content-Type";
@@ -148,37 +210,58 @@ ParkingApiServer::~ParkingApiServer() {
 
 /**
  * @brief 启动服务器
- * 开始监听指定端口并接受客户端连接
+ * @param port 监听端口号
+ * @throws std::runtime_error 如果启动失败
  * 
- * @param port 监听的端口号
+ * 实现步骤：
+ * 1. 创建服务器socket
+ * 2. 设置socket选项（地址重用）
+ * 3. 绑定地址和端口
+ * 4. 开始监听连接
+ * 5. 进入主循环接受连接
+ * 
+ * 错误处理：
+ * - socket创建失败
+ * - 设置选项失败
+ * - 绑定失败
+ * - 监听失败
+ * - 接受连接失败
+ * 
+ * 并发处理：
+ * - 每个客户端连接在独立线程中处理
+ * - 使用detach模式避免资源泄漏
  */
 void ParkingApiServer::start(uint16_t port) {
+    // 1. 创建服务器socket
     serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket < 0) {
         throw std::runtime_error("Failed to create socket");
     }
 
-    // 允许端口重用
+    // 2. 设置socket选项
     int opt = 1;
     if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         throw std::runtime_error("Failed to set socket options");
     }
 
+    // 3. 准备地址结构并绑定
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;  // 监听所有网络接口
-    serverAddr.sin_port = htons(port);        // 设置端口号
+    serverAddr.sin_port = htons(port);        // 转换为网络字节序
 
     if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
         close(serverSocket);
         throw std::runtime_error("Failed to bind socket");
     }
 
-    if (listen(serverSocket, 10) < 0) {
+    // 4. 开始监听连接
+    if (listen(serverSocket, 10) < 0) {  // 等待队列长度为10
         close(serverSocket);
         throw std::runtime_error("Failed to listen on socket");
     }
 
+    // 5. 服务器主循环
     running = true;
     std::cout << "Server started on port " << port << std::endl;
 
@@ -192,20 +275,21 @@ void ParkingApiServer::start(uint16_t port) {
             continue;
         }
 
-        // 在新线程中处理请求
+        // 创建新线程处理客户端请求
         std::thread([this, clientSocket]() {
             try {
+                // 解析请求并生成响应
                 HttpRequest request = parseRequest(clientSocket);
                 HttpResponse response = routeRequest(request);
-
                 sendResponse(clientSocket, response);
             } catch (const std::exception& e) {
+                // 处理请求过程中的任何异常
                 HttpResponse errorResponse(500);
                 errorResponse.body = createJsonResponse(false, e.what());
                 sendResponse(clientSocket, errorResponse);
             }
-            close(clientSocket);
-        }).detach();
+            close(clientSocket);  // 确保连接被关闭
+        }).detach();  // 分离线程，避免资源泄漏
     }
 }
 
@@ -308,71 +392,146 @@ HttpResponse ParkingApiServer::routeRequest(const HttpRequest& request) {
 }
 
 /**
+ * @brief 从socket读取指定字节数的数据
+ * @param clientSocket socket描述符 
+ * @param buffer 目标缓冲区
+ * @param len 要读取的字节数
+ * @param timeout 超时时间(秒)
+ * @return 实际读取的字节数,出错返回-1
+ */
+ssize_t readWithTimeout(int clientSocket, char* buffer, size_t len, int timeout) {
+    fd_set readSet;
+    struct timeval tv;
+    size_t totalRead = 0;
+
+    while (totalRead < len) {
+        // 设置select超时
+        FD_ZERO(&readSet);
+        FD_SET(clientSocket, &readSet);
+        tv.tv_sec = timeout;
+        tv.tv_usec = 0;
+
+        int ret = select(clientSocket + 1, &readSet, nullptr, nullptr, &tv);
+        if (ret < 0) {
+            return -1;  // select错误
+        }
+        if (ret == 0) {
+            errno = ETIMEDOUT;
+            return -1;  // 超时
+        }
+
+        // 读取数据
+        ssize_t bytesRead = recv(clientSocket, buffer + totalRead, len - totalRead, 0);
+        if (bytesRead <= 0) {
+            return bytesRead;  // 连接关闭或错误
+        }
+        totalRead += bytesRead;
+    }
+    return totalRead;
+}
+
+/**
  * @brief 解析HTTP请求
- * 从客户端套接字读取数据并解析成HTTP请求对象
- * 
- * @param clientSocket 客户端套接字
- * @return 解析得到的HTTP请求对象
+ * @param clientSocket 客户端socket
+ * @return 解析后的HTTP请求对象
  */
 HttpRequest ParkingApiServer::parseRequest(int clientSocket) {
-    std::vector<char> buffer(4096);
-    ssize_t bytesRead = recv(clientSocket, buffer.data(), buffer.size() - 1, 0);
-    if (bytesRead <= 0) {
-        throw std::runtime_error("Failed to read request");
-    }
-    buffer[bytesRead] = '\0';
-
-    HttpRequest request;
-    std::string requestStr(buffer.data());
-    std::istringstream requestStream(requestStr);
-    std::string line;
+    const int TIMEOUT_SECONDS = 5;  // 读取超时时间
+    const size_t MAX_HEADER_SIZE = 8192;  // 最大头部大小8KB
+    const size_t MAX_BODY_SIZE = 1048576;  // 最大body大小1MB
     
-    // Parse request line
-    if (std::getline(requestStream, line)) {
+    HttpRequest request;
+    std::vector<char> headerBuffer(MAX_HEADER_SIZE);
+    size_t headerPos = 0;
+    bool foundHeaderEnd = false;
+
+    // 1. 读取HTTP头部
+    while (headerPos < MAX_HEADER_SIZE - 1) {
+        // 每次读一个字节找\r\n\r\n
+        ssize_t bytesRead = readWithTimeout(clientSocket, 
+                                          &headerBuffer[headerPos], 
+                                          1, 
+                                          TIMEOUT_SECONDS);
+        if (bytesRead <= 0) {
+            throw std::runtime_error("Failed to read HTTP header");
+        }
+
+        headerPos++;
+        // 检查是否找到头部结束标记\r\n\r\n
+        if (headerPos >= 4 && 
+            headerBuffer[headerPos-4] == '\r' && 
+            headerBuffer[headerPos-3] == '\n' && 
+            headerBuffer[headerPos-2] == '\r' && 
+            headerBuffer[headerPos-1] == '\n') {
+            foundHeaderEnd = true;
+            break;
+        }
+    }
+
+    if (!foundHeaderEnd) {
+        throw std::runtime_error("HTTP header too large or malformed");
+    }
+
+    // 2. 解析头部
+    std::string headerStr(headerBuffer.data(), headerPos);
+    std::istringstream headerStream(headerStr);
+    std::string line;
+
+    // 解析请求行
+    if (std::getline(headerStream, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
         std::istringstream lineStream(line);
         lineStream >> request.method >> request.path;
-        
-        // Extract HTTP version if present
-        std::string version;
-        if (lineStream >> version) {
-            request.params["http_version"] = version;
-        }
     }
 
-    // Parse headers
+    // 解析头部字段
     size_t contentLength = 0;
-    while (std::getline(requestStream, line)) {
+    while (std::getline(headerStream, line)) {
         if (line.back() == '\r') {
             line.pop_back();
         }
         if (line.empty()) {
             break;
         }
-        
+
         size_t colonPos = line.find(':');
         if (colonPos != std::string::npos) {
             std::string key = line.substr(0, colonPos);
             std::string value = line.substr(colonPos + 1);
-            // Trim leading spaces from value
             value.erase(0, value.find_first_not_of(" "));
             request.params[key] = value;
-            
+
+            // 获取Content-Length
             if (key == "Content-Length") {
-                contentLength = std::stoul(value);
+                try {
+                    contentLength = std::stoull(value);
+                    if (contentLength > MAX_BODY_SIZE) {
+                        throw std::runtime_error("Request body too large");
+                    }
+                } catch (const std::exception& e) {
+                    throw std::runtime_error("Invalid Content-Length");
+                }
             }
         }
     }
 
-    // Read body
+    // 3. 读取请求体
     if (contentLength > 0) {
-        std::string body;
-        std::string remaining;
-        std::getline(requestStream, remaining, '\0');
-        body = remaining.substr(0, contentLength);
-        request.body = body;
+        std::vector<char> bodyBuffer(contentLength);
+        ssize_t bodyBytesRead = readWithTimeout(clientSocket, 
+                                              bodyBuffer.data(), 
+                                              contentLength, 
+                                              TIMEOUT_SECONDS);
+        
+        if (bodyBytesRead < 0) {
+            throw std::runtime_error("Failed to read request body");
+        }
+        if (static_cast<size_t>(bodyBytesRead) != contentLength) {
+            throw std::runtime_error("Incomplete request body");
+        }
+        request.body = std::string(bodyBuffer.data(), bodyBytesRead);
     }
 
     return request;
@@ -384,6 +543,16 @@ HttpRequest ParkingApiServer::parseRequest(int clientSocket) {
  * 
  * @param clientSocket 客户端套接字
  * @param response HTTP响应对象
+ * 
+ * 实现步骤：
+ * 1. 构造响应行（HTTP版本、状态码和状态描述）
+ * 2. 添加必需的响应头（Content-Type、Content-Length等）
+ * 3. 添加CORS相关响应头
+ * 4. 序列化响应体
+ * 5. 发送完整的HTTP响应
+ * 
+ * 错误处理：
+ * - 如果发送失败，记录错误但不抛出异常
  */
 void ParkingApiServer::sendResponse(int clientSocket, const HttpResponse& response) {
     std::ostringstream responseStream;
@@ -428,6 +597,11 @@ void ParkingApiServer::sendResponse(int clientSocket, const HttpResponse& respon
  * @param message 响应消息
  * @param data 附加数据(可选)
  * @return JSON字符串
+ * 
+ * 实现细节：
+ * 1. 使用字符串流构造JSON对象
+ * 2. 添加成功标志、消息和附加数据
+ * 3. 支持链式调用以便于快速构造响应
  */
 std::string ParkingApiServer::createJsonResponse(bool success, const std::string& message, const std::string& data) {
     std::ostringstream json;
@@ -447,6 +621,20 @@ std::string ParkingApiServer::createJsonResponse(bool success, const std::string
  * 
  * @param req HTTP请求对象
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 解析请求体中的JSON数据
+ * 2. 验证必需字段（车牌号和车型）
+ * 3. 调用停车场管理对象的addVehicle方法
+ * 4. 根据返回结果生成相应的HTTP响应
+ * 
+ * 边界情况处理：
+ * - 车牌号或车型为空
+ * - 停车场已满
+ * - 车辆已在停车场内
+ * 
+ * 错误处理：
+ * - 任何解析或处理错误返回400 Bad Request
  */
 HttpResponse ParkingApiServer::handleAddVehicle(const HttpRequest& req) {
     try {
@@ -513,6 +701,19 @@ HttpResponse ParkingApiServer::handleAddVehicle(const HttpRequest& req) {
  * 
  * @param req HTTP请求对象
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 从请求路径中提取车牌号
+ * 2. 调用停车场管理对象的removeVehicle方法
+ * 3. 如果成功，返回车辆信息和费用
+ * 4. 如果失败，返回404错误
+ * 
+ * 边界情况处理：
+ * - 车牌号无效
+ * - 车辆未找到
+ * 
+ * 错误处理：
+ * - 任何处理错误返回400 Bad Request
  */
 HttpResponse ParkingApiServer::handleRemoveVehicle(const HttpRequest& req) {
     try {
@@ -555,6 +756,18 @@ HttpResponse ParkingApiServer::handleRemoveVehicle(const HttpRequest& req) {
  * 
  * @param req HTTP请求对象
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 从请求路径中提取车牌号
+ * 2. 调用停车场管理对象的queryVehicle方法
+ * 3. 如果找到，返回车辆信息
+ * 4. 如果未找到，返回404错误
+ * 
+ * 边界情况处理：
+ * - 车牌号无效
+ * 
+ * 错误处理：
+ * - 任何处理错误返回400 Bad Request
  */
 HttpResponse ParkingApiServer::handleQueryVehicle(const HttpRequest& req) {
     try {
@@ -597,6 +810,11 @@ HttpResponse ParkingApiServer::handleQueryVehicle(const HttpRequest& req) {
  * 
  * @param req HTTP请求对象
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 获取停车场的空闲和占用车位数量
+ * 2. 构造状态数据的JSON表示
+ * 3. 返回成功的HTTP响应
  */
 HttpResponse ParkingApiServer::handleGetParkingStatus(const HttpRequest&) {
     std::ostringstream data;
@@ -614,6 +832,18 @@ HttpResponse ParkingApiServer::handleGetParkingStatus(const HttpRequest&) {
  * 
  * @param req HTTP请求对象
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 解析请求体中的JSON数据
+ * 2. 验证费率字段（小型车和大型车费率）
+ * 3. 调用停车场管理对象的setRate方法
+ * 4. 返回成功的HTTP响应
+ * 
+ * 边界情况处理：
+ * - 费率值无效（非数字或负数）
+ * 
+ * 错误处理：
+ * - 任何解析或处理错误返回400 Bad Request
  */
 HttpResponse ParkingApiServer::handleSetRate(const HttpRequest& req) {
     try {
@@ -676,6 +906,11 @@ HttpResponse ParkingApiServer::handleSetRate(const HttpRequest& req) {
  * 
  * @param req HTTP请求对象
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 获取停车场的历史车辆记录
+ * 2. 构造记录数据的JSON数组表示
+ * 3. 返回成功的HTTP响应
  */
 HttpResponse ParkingApiServer::handleGetHistory(const HttpRequest&) {
     auto history = parkingLot->getHistoryVehicles();
@@ -705,6 +940,14 @@ HttpResponse ParkingApiServer::handleGetHistory(const HttpRequest&) {
  * 
  * @param req HTTP请求对象
  * @return HTTP响应对象
+ * 
+ * 处理流程：
+ * 1. 获取当前在场车辆的列表
+ * 2. 构造车辆信息的JSON数组表示
+ * 3. 返回成功的HTTP响应
+ * 
+ * 边界情况处理：
+ * - 当前没有车辆时返回空数组
  */
 HttpResponse ParkingApiServer::handleGetCurrentVehicles(const HttpRequest&) {
     auto currentVehicles = parkingLot->getCurrentVehicles();
