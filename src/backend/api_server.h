@@ -15,6 +15,24 @@
 #include <atomic>
 #include <vector>
 
+enum class LogLevel {
+    DEBUG,
+    INFO,
+    WARNING,
+    ERROR
+};
+
+class Logger {
+public:
+    static void log(LogLevel level, const std::string& message);
+    static void setLogLevel(LogLevel level);
+    
+private:
+    static LogLevel currentLevel;
+    static std::mutex logMutex;
+    static const char* getLevelString(LogLevel level);
+};
+
 class HttpRequest {
 public:
     std::string method;
@@ -127,6 +145,34 @@ private:
     const size_t MAX_THREADS = 32;           // 最大线程数
     const size_t MAX_QUEUE_SIZE = 100;       // 最大队列长度
     std::atomic<size_t> activeConnections;   // 当前活动连接数
+
+    // 路由注册方法
+    void registerRoute(const std::string& method, 
+                      const std::string& path, 
+                      const RouteHandler& handler, 
+                      bool isPrefix = false) {
+        routes.push_back({method, path, handler, isPrefix});
+    }
+
+    template<typename Func>
+    void GET(const std::string& path, Func&& handler, bool isPrefix = false) {
+        registerRoute("GET", path, std::forward<Func>(handler), isPrefix);
+    }
+
+    template<typename Func>
+    void POST(const std::string& path, Func&& handler, bool isPrefix = false) {
+        registerRoute("POST", path, std::forward<Func>(handler), isPrefix);
+    }
+
+    template<typename Func>
+    void PUT(const std::string& path, Func&& handler, bool isPrefix = false) {
+        registerRoute("PUT", path, std::forward<Func>(handler), isPrefix);
+    }
+
+    template<typename Func>
+    void DELETE(const std::string& path, Func&& handler, bool isPrefix = false) {
+        registerRoute("DELETE", path, std::forward<Func>(handler), isPrefix);
+    }
 
 public:
     ParkingApiServer(size_t capacity = 100, double smallRate = 5.0, double largeRate = 8.0);

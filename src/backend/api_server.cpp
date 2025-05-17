@@ -323,6 +323,18 @@ void ParkingApiServer::start(uint16_t port) {
             continue;
         }
 
+        // 使用RAII来管理连接计数
+        class ConnectionGuard {
+            std::atomic<size_t>& connections;
+        public:
+            ConnectionGuard(std::atomic<size_t>& conn) : connections(conn) {
+                ++connections;
+            }
+            ~ConnectionGuard() {
+                --connections;
+            }
+        };
+
         // 检查当前连接数是否超过限制
         if (activeConnections.load() >= MAX_QUEUE_SIZE) {
             std::cerr << "Too many connections, dropping new connection" << std::endl;
@@ -335,14 +347,23 @@ void ParkingApiServer::start(uint16_t port) {
 
         // 提交任务到线程池
         threadPool->enqueue([this, clientSocket] {
-            activeConnections++;  // 增加活动连接计数
+            // 使用RAII确保连接计数正确管理
+            ConnectionGuard guard(activeConnections);
             
             try {
                 // 设置socket读取超时
                 struct timeval tv;
-                tv.tv_sec = 5;  // 5秒超时
+                tv.tv_sec = 30;  // 增加超时时间到30秒，给复杂请求更多处理时间
                 tv.tv_usec = 0;
-                setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                if (setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+                    throw std::runtime_error("Failed to set socket timeout");
+                }
+
+                // 设置TCP keep-alive
+                int keepAlive = 1;
+                if (setsockopt(clientSocket, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(keepAlive)) < 0) {
+                    throw std::runtime_error("Failed to set keep-alive");
+                }
                 
                 // 处理请求
                 HttpRequest request = parseRequest(clientSocket);
@@ -350,14 +371,23 @@ void ParkingApiServer::start(uint16_t port) {
                 sendResponse(clientSocket, response);
                 
             } catch (const std::exception& e) {
-                // 发送错误响应
-                HttpResponse errorResponse(500);
-                errorResponse.body = createJsonResponse(false, e.what());
-                sendResponse(clientSocket, errorResponse);
+                std::cerr << "Error handling client: " << e.what() << std::endl;
+                
+                try {
+                    // 发送错误响应，包含更多错误细节
+                    HttpResponse errorResponse(500);
+                    errorResponse.headers["X-Error-Detail"] = e.what();
+                    errorResponse.body = createJsonResponse(false, "Internal server error occurred: " + 
+                        std::string(e.what()));
+                    sendResponse(clientSocket, errorResponse);
+                } catch (...) {
+                    // 如果发送错误响应也失败，只能记录日志
+                    std::cerr << "Failed to send error response" << std::endl;
+                }
             }
             
-            close(clientSocket);  // 确保关闭连接
-            activeConnections--;  // 减少活动连接计数
+            shutdown(clientSocket, SHUT_RDWR);  // 正确关闭连接
+            close(clientSocket);
         });
     }
 }
@@ -379,43 +409,29 @@ void ParkingApiServer::stop() {
  * 在这里配置所有的API路由规则
  */
 void ParkingApiServer::initializeRoutes() {
-    // 路由表结构: {HTTP方法, URL路径, 处理函数, 是否使用前缀匹配}
-    routes = {
-        // 处理车辆入场请求 POST /api/vehicle
-        {"POST", "/api/vehicle", 
-         std::bind(&ParkingApiServer::handleAddVehicle, this, std::placeholders::_1), 
-         false},  // false表示精确匹配路径
+    // 使用新的路由注册方法重构路由表初始化
+    POST("/api/vehicle", 
+         std::bind(&ParkingApiServer::handleAddVehicle, this, std::placeholders::_1));
 
-        // 处理车辆出场请求 DELETE /api/vehicle/{车牌号}
-        {"DELETE", "/api/vehicle/", 
-         std::bind(&ParkingApiServer::handleRemoveVehicle, this, std::placeholders::_1), 
-         true},   // true表示前缀匹配,因为后面还有动态参数(车牌号)
+    DELETE("/api/vehicle/", 
+           std::bind(&ParkingApiServer::handleRemoveVehicle, this, std::placeholders::_1),
+           true);  // 使用前缀匹配
 
-        // 查询车辆信息 GET /api/vehicle/{车牌号}
-        {"GET", "/api/vehicle/", 
-         std::bind(&ParkingApiServer::handleQueryVehicle, this, std::placeholders::_1), 
-         true},   // 同样使用前缀匹配
+    GET("/api/vehicle/", 
+        std::bind(&ParkingApiServer::handleQueryVehicle, this, std::placeholders::_1),
+        true);
 
-        // 获取停车场状态 GET /api/status
-        {"GET", "/api/status", 
-         std::bind(&ParkingApiServer::handleGetParkingStatus, this, std::placeholders::_1), 
-         false},
+    GET("/api/status", 
+        std::bind(&ParkingApiServer::handleGetParkingStatus, this, std::placeholders::_1));
 
-        // 更新停车费率 PUT /api/rate
-        {"PUT", "/api/rate", 
-         std::bind(&ParkingApiServer::handleSetRate, this, std::placeholders::_1), 
-         false},
+    PUT("/api/rate", 
+        std::bind(&ParkingApiServer::handleSetRate, this, std::placeholders::_1));
 
-        // 获取历史记录 GET /api/history
-        {"GET", "/api/history", 
-         std::bind(&ParkingApiServer::handleGetHistory, this, std::placeholders::_1), 
-         false},
+    GET("/api/history", 
+        std::bind(&ParkingApiServer::handleGetHistory, this, std::placeholders::_1));
 
-        // 获取当前在场车辆 GET /api/current-vehicles
-        {"GET", "/api/current-vehicles", 
-         std::bind(&ParkingApiServer::handleGetCurrentVehicles, this, std::placeholders::_1), 
-         false}
-    };
+    GET("/api/current-vehicles", 
+        std::bind(&ParkingApiServer::handleGetCurrentVehicles, this, std::placeholders::_1));
 }
 
 /**
@@ -656,209 +672,189 @@ void ParkingApiServer::sendResponse(int clientSocket, const HttpResponse& respon
     responseStream << response.body;
 
     std::string responseStr = responseStream.str();
-    send(clientSocket, responseStr.c_str(), responseStr.length(), 0);
+    size_t totalSent = 0;
+    const char* buffer = responseStr.c_str();
+    size_t length = responseStr.length();
+    
+    while (totalSent < length) {
+        ssize_t sent = send(clientSocket, 
+                          buffer + totalSent, 
+                          length - totalSent, 
+                          MSG_NOSIGNAL);  // 防止SIGPIPE信号
+        
+        if (sent < 0) {
+            if (errno == EINTR) {
+                // 被信号中断，继续尝试
+                continue;
+            }
+            std::cerr << "Error sending response: " << strerror(errno) << std::endl;
+            return;
+        }
+        
+        totalSent += sent;
+    }
 }
 
 /**
- * @brief 创建JSON格式的响应体
- * 
+ * @brief 创建JSON格式的响应字符串
  * @param success 操作是否成功
  * @param message 响应消息
- * @param data 附加数据(可选)
- * @return JSON字符串
- * 
- * 实现细节：
- * 1. 使用字符串流构造JSON对象
- * 2. 添加成功标志、消息和附加数据
- * 3. 支持链式调用以便于快速构造响应
+ * @param data 可选的数据字段
+ * @return JSON格式的字符串
  */
 std::string ParkingApiServer::createJsonResponse(bool success, const std::string& message, const std::string& data) {
     std::ostringstream json;
-    json << "{";
-    json << "\"success\":" << (success ? "true" : "false") << ",";
-    json << "\"message\":\"" << message << "\"";
+    json << "{\"success\":" << (success ? "true" : "false")
+         << ",\"message\":\"" << message << "\"";
+    
     if (!data.empty()) {
         json << ",\"data\":" << data;
     }
+    
     json << "}";
     return json.str();
 }
 
+// Add at the top of the file, after includes
+LogLevel Logger::currentLevel = LogLevel::INFO;
+std::mutex Logger::logMutex;
+
+const char* Logger::getLevelString(LogLevel level) {
+    switch (level) {
+        case LogLevel::DEBUG: return "DEBUG";
+        case LogLevel::INFO: return "INFO";
+        case LogLevel::WARNING: return "WARNING";
+        case LogLevel::ERROR: return "ERROR";
+        default: return "UNKNOWN";
+    }
+}
+
+void Logger::log(LogLevel level, const std::string& message) {
+    if (level < currentLevel) return;
+    
+    std::lock_guard<std::mutex> lock(logMutex);
+    auto now = std::chrono::system_clock::now();
+    auto now_c = std::chrono::system_clock::to_time_t(now);
+    auto* tm = std::localtime(&now_c);
+    
+    std::cerr << std::put_time(tm, "%Y-%m-%d %H:%M:%S") 
+              << " [" << getLevelString(level) << "] "
+              << message << std::endl;
+}
+
+void Logger::setLogLevel(LogLevel level) {
+    currentLevel = level;
+}
+
 /**
- * @brief 处理车辆入场请求
- * 解析请求体中的车牌号和车型, 并将车辆信息添加到停车场
- * 
- * @param req HTTP请求对象
- * @return HTTP响应对象
- * 
- * 处理流程：
- * 1. 解析请求体中的JSON数据
- * 2. 验证必需字段（车牌号和车型）
- * 3. 调用停车场管理对象的addVehicle方法
- * 4. 根据返回结果生成相应的HTTP响应
- * 
- * 边界情况处理：
- * - 车牌号或车型为空
- * - 停车场已满
- * - 车辆已在停车场内
- * 
- * 错误处理：
- * - 任何解析或处理错误返回400 Bad Request
+ * @brief 处理添加车辆的请求
  */
 HttpResponse ParkingApiServer::handleAddVehicle(const HttpRequest& req) {
     try {
-        std::cout << "Received body: " << req.body << std::endl;
-        
-        std::string body = req.body;
-        // Remove any leading/trailing whitespace
-        body.erase(0, body.find_first_not_of(" \n\r\t"));
-        body.erase(body.find_last_not_of(" \n\r\t") + 1);
-        
-        // Find plate and type values
-        size_t plateStart = body.find("\"plate\"");
-        size_t typeStart = body.find("\"type\"");
-        
+        // 查找请求体中的plate和type字段
+        size_t plateStart = req.body.find("\"plate\":\"");
+        size_t typeStart = req.body.find("\"type\":\"");
         if (plateStart == std::string::npos || typeStart == std::string::npos) {
-            std::cout << "Missing plate or type fields" << std::endl;
             HttpResponse response(400);
-            response.body = createJsonResponse(false, "Missing required fields");
+            response.body = createJsonResponse(false, "Missing plate or type in request");
             return response;
         }
 
-        // Extract plate value
-        plateStart = body.find(':', plateStart) + 1;
-        plateStart = body.find('\"', plateStart) + 1;
-        size_t plateEnd = body.find('\"', plateStart);
-        std::string plate = body.substr(plateStart, plateEnd - plateStart);
+        // 提取车牌号和车型
+        plateStart += 9;  // 跳过"plate":\"
+        size_t plateEnd = req.body.find("\"", plateStart);
+        std::string plate = req.body.substr(plateStart, plateEnd - plateStart);
 
-        // Extract type value
-        typeStart = body.find(':', typeStart) + 1;
-        typeStart = body.find('\"', typeStart) + 1;
-        size_t typeEnd = body.find('\"', typeStart);
-        std::string type = body.substr(typeStart, typeEnd - typeStart);
+        typeStart += 8;  // 跳过"type":\"
+        size_t typeEnd = req.body.find("\"", typeStart);
+        std::string type = req.body.substr(typeStart, typeEnd - typeStart);
 
-        std::cout << "Extracted plate: " << plate << ", type: " << type << std::endl;
-
+        // 添加车辆
         if (parkingLot->addVehicle(plate, type)) {
-            HttpResponse response;
+            HttpResponse response(200);
             response.body = createJsonResponse(true, "Vehicle added successfully");
             return response;
         } else {
-            // 检查是否是因为车辆已存在而失败
-            Vehicle v;
-            if (parkingLot->queryVehicle(plate, v) && v.getExitTime() == 0) {
-                HttpResponse response(400);
-                response.body = createJsonResponse(false, "该车辆已在停车场内");
-                return response;
-            } else {
-                HttpResponse response(400);
-                response.body = createJsonResponse(false, "停车场已满");
-                return response;
-            }
+            HttpResponse response(400);
+            response.body = createJsonResponse(false, "Failed to add vehicle, parking lot might be full");
+            return response;
         }
     } catch (const std::exception& e) {
-        std::cerr << "Error in handleAddVehicle: " << e.what() << std::endl;
-        HttpResponse response(400);
-        response.body = createJsonResponse(false, std::string("Error: ") + e.what());
+        HttpResponse response(500);
+        response.body = createJsonResponse(false, std::string("Internal error: ") + e.what());
         return response;
     }
 }
 
 /**
- * @brief 处理车辆出场请求
- * 根据车牌号移除停车场中的车辆信息，并返回车辆信息和费用
- * 
- * @param req HTTP请求对象
- * @return HTTP响应对象
- * 
- * 处理流程：
- * 1. 从请求路径中提取车牌号
- * 2. 调用停车场管理对象的removeVehicle方法
- * 3. 如果成功，返回车辆信息和费用
- * 4. 如果失败，返回404错误
- * 
- * 边界情况处理：
- * - 车牌号无效
- * - 车辆未找到
- * 
- * 错误处理：
- * - 任何处理错误返回400 Bad Request
+ * @brief 处理移除车辆的请求
  */
 HttpResponse ParkingApiServer::handleRemoveVehicle(const HttpRequest& req) {
     try {
-        size_t pos = req.path.find_last_of('/');
-        if (pos == std::string::npos) {
-            return HttpResponse(400);
+        // 从路径中提取车牌号
+        size_t lastSlash = req.path.find_last_of('/');
+        if (lastSlash == std::string::npos) {
+            HttpResponse response(400);
+            response.body = createJsonResponse(false, "Invalid request path");
+            return response;
         }
 
-        std::string encodedPlate = req.path.substr(pos + 1);
-        std::string plate = urlDecode(encodedPlate);
-        std::cout << "Removing vehicle with plate: " << plate << std::endl;
-
-        if (parkingLot->removeVehicle(plate)) {
-            Vehicle v;
-            parkingLot->queryVehicle(plate, v);
-            
-            std::ostringstream data;
-            data << "{\"plate\":\"" << v.getLicensePlate() << "\",";
-            data << "\"type\":\"" << v.getType() << "\",";
-            data << "\"fee\":" << v.getFee() << "}";
-
-            HttpResponse response;
-            response.body = createJsonResponse(true, "Vehicle removed successfully", data.str());
-            return response;
-        } else {
+        std::string plate = urlDecode(req.path.substr(lastSlash + 1));
+        Vehicle vehicleInfo;
+        
+        // 先查询车辆信息
+        if (!parkingLot->queryVehicle(plate, vehicleInfo)) {
             HttpResponse response(404);
             response.body = createJsonResponse(false, "Vehicle not found");
             return response;
         }
+
+        // 移除车辆
+        if (parkingLot->removeVehicle(plate)) {
+            // 构造响应数据
+            std::ostringstream data;
+            data << "{\"plate\":\"" << plate << "\","
+                 << "\"type\":\"" << vehicleInfo.getType() << "\","
+                 << "\"fee\":" << vehicleInfo.getFee() << "}";
+
+            HttpResponse response(200);
+            response.body = createJsonResponse(true, "Vehicle removed successfully", data.str());
+            return response;
+        } else {
+            HttpResponse response(400);
+            response.body = createJsonResponse(false, "Failed to remove vehicle");
+            return response;
+        }
     } catch (const std::exception& e) {
-        HttpResponse response(400);
-        response.body = createJsonResponse(false, e.what());
+        HttpResponse response(500);
+        response.body = createJsonResponse(false, std::string("Internal error: ") + e.what());
         return response;
     }
 }
 
 /**
- * @brief 处理车辆查询请求
- * 根据车牌号返回车辆的入场时间、出场时间和费用
- * 
- * @param req HTTP请求对象
- * @return HTTP响应对象
- * 
- * 处理流程：
- * 1. 从请求路径中提取车牌号
- * 2. 调用停车场管理对象的queryVehicle方法
- * 3. 如果找到，返回车辆信息
- * 4. 如果未找到，返回404错误
- * 
- * 边界情况处理：
- * - 车牌号无效
- * 
- * 错误处理：
- * - 任何处理错误返回400 Bad Request
+ * @brief 处理查询车辆信息的请求
  */
 HttpResponse ParkingApiServer::handleQueryVehicle(const HttpRequest& req) {
     try {
-        size_t pos = req.path.find_last_of('/');
-        if (pos == std::string::npos) {
-            return HttpResponse(400);
+        size_t lastSlash = req.path.find_last_of('/');
+        if (lastSlash == std::string::npos) {
+            HttpResponse response(400);
+            response.body = createJsonResponse(false, "Invalid request path");
+            return response;
         }
 
-        std::string encodedPlate = req.path.substr(pos + 1);
-        std::string plate = urlDecode(encodedPlate);
-        std::cout << "Querying vehicle with plate: " << plate << std::endl;
-
-        Vehicle v;
-        if (parkingLot->queryVehicle(plate, v)) {
+        std::string plate = urlDecode(req.path.substr(lastSlash + 1));
+        Vehicle vehicle;
+        
+        if (parkingLot->queryVehicle(plate, vehicle)) {
             std::ostringstream data;
-            data << "{\"plate\":\"" << v.getLicensePlate() << "\",";
-            data << "\"type\":\"" << v.getType() << "\",";
-            data << "\"entryTime\":" << v.getEntryTime() << ",";
-            data << "\"exitTime\":" << v.getExitTime() << ",";
-            data << "\"fee\":" << v.getFee() << "}";
+            data << "{\"plate\":\"" << plate << "\","
+                 << "\"type\":\"" << vehicle.getType() << "\","
+                 << "\"entryTime\":" << vehicle.getEntryTime() << ","
+                 << "\"fee\":" << vehicle.getFee() << "}";
 
-            HttpResponse response;
+            HttpResponse response(200);
             response.body = createJsonResponse(true, "Vehicle found", data.str());
             return response;
         } else {
@@ -867,175 +863,112 @@ HttpResponse ParkingApiServer::handleQueryVehicle(const HttpRequest& req) {
             return response;
         }
     } catch (const std::exception& e) {
-        HttpResponse response(400);
-        response.body = createJsonResponse(false, e.what());
+        HttpResponse response(500);
+        response.body = createJsonResponse(false, std::string("Internal error: ") + e.what());
         return response;
     }
 }
 
 /**
- * @brief 处理停车场状态查询请求
- * 返回当前停车场的空闲车位和占用车位数量
- * 
- * @param req HTTP请求对象
- * @return HTTP响应对象
- * 
- * 处理流程：
- * 1. 获取停车场的空闲和占用车位数量
- * 2. 构造状态数据的JSON表示
- * 3. 返回成功的HTTP响应
+ * @brief 处理获取停车场状态的请求
  */
 HttpResponse ParkingApiServer::handleGetParkingStatus(const HttpRequest&) {
-    std::ostringstream data;
-    data << "{\"available\":" << parkingLot->getAvailableSpaces() << ",";
-    data << "\"occupied\":" << parkingLot->getOccupiedSpaces() << "}";
+    try {
+        std::ostringstream data;
+        data << "{\"available\":" << parkingLot->getAvailableSpaces() << ","
+             << "\"occupied\":" << parkingLot->getOccupiedSpaces() << ","
+             << "\"smallRate\":" << parkingLot->getSmallRate() << ","
+             << "\"largeRate\":" << parkingLot->getLargeRate() << "}";
 
-    HttpResponse response;
-    response.body = createJsonResponse(true, "Status retrieved", data.str());
-    return response;
+        HttpResponse response(200);
+        response.body = createJsonResponse(true, "Status retrieved", data.str());
+        return response;
+    } catch (const std::exception& e) {
+        HttpResponse response(500);
+        response.body = createJsonResponse(false, std::string("Internal error: ") + e.what());
+        return response;
+    }
 }
 
-/**
- * @brief 处理费率设置请求
- * 更新小型车和大型车的每小时费率
- * 
- * @param req HTTP请求对象
- * @return HTTP响应对象
- * 
- * 处理流程：
- * 1. 解析请求体中的JSON数据
- * 2. 验证费率字段（小型车和大型车费率）
- * 3. 调用停车场管理对象的setRate方法
- * 4. 返回成功的HTTP响应
- * 
- * 边界情况处理：
- * - 费率值无效（非数字或负数）
- * 
- * 错误处理：
- * - 任何解析或处理错误返回400 Bad Request
- */
 HttpResponse ParkingApiServer::handleSetRate(const HttpRequest& req) {
     try {
-        std::cout << "Received rate update body: " << req.body << std::endl;
-        
-        std::string body = req.body;
-        // Remove any leading/trailing whitespace
-        body.erase(0, body.find_first_not_of(" \n\r\t"));
-        body.erase(body.find_last_not_of(" \n\r\t") + 1);
-
-        // Extract smallRate
-        size_t smallRatePos = body.find("\"smallRate\"");
-        if (smallRatePos == std::string::npos) {
-            throw std::runtime_error("Missing smallRate field");
+        size_t smallRateStart = req.body.find("\"smallRate\":");
+        size_t largeRateStart = req.body.find("\"largeRate\":");
+        if (smallRateStart == std::string::npos || largeRateStart == std::string::npos) {
+            HttpResponse response(400);
+            response.body = createJsonResponse(false, "Missing rate parameters");
+            return response;
         }
-        smallRatePos = body.find(':', smallRatePos) + 1;
-        while (smallRatePos < body.length() && std::isspace(body[smallRatePos])) {
-            ++smallRatePos;
-        }
-        size_t smallRateEnd = body.find_first_not_of("0123456789.", smallRatePos);
-        std::string smallRateStr = body.substr(smallRatePos, smallRateEnd - smallRatePos);
 
-        // Extract largeRate
-        size_t largeRatePos = body.find("\"largeRate\"");
-        if (largeRatePos == std::string::npos) {
-            throw std::runtime_error("Missing largeRate field");
-        }
-        largeRatePos = body.find(':', largeRatePos) + 1;
-        while (largeRatePos < body.length() && std::isspace(body[largeRatePos])) {
-            ++largeRatePos;
-        }
-        size_t largeRateEnd = body.find_first_not_of("0123456789.", largeRatePos);
-        std::string largeRateStr = body.substr(largeRatePos, largeRateEnd - largeRatePos);
+        smallRateStart += 11;  // 跳过"smallRate":
+        largeRateStart += 11;  // 跳过"largeRate":
 
-        std::cout << "Extracted rates - small: " << smallRateStr << ", large: " << largeRateStr << std::endl;
-
-        double smallRate = std::stod(smallRateStr);
-        double largeRate = std::stod(largeRateStr);
-
-        if (smallRate <= 0 || largeRate <= 0) {
-            throw std::runtime_error("Rates must be positive numbers");
-        }
+        double smallRate = std::stod(req.body.substr(smallRateStart));
+        double largeRate = std::stod(req.body.substr(largeRateStart));
 
         parkingLot->setRate(smallRate, largeRate);
 
-        HttpResponse response;
+        HttpResponse response(200);
         response.body = createJsonResponse(true, "Rates updated successfully");
         return response;
     } catch (const std::exception& e) {
-        std::cerr << "Error updating rates: " << e.what() << std::endl;
-        HttpResponse response(400);
-        response.body = createJsonResponse(false, std::string("Error updating rates: ") + e.what());
+        HttpResponse response(500);
+        response.body = createJsonResponse(false, std::string("Internal error: ") + e.what());
         return response;
     }
 }
 
-/**
- * @brief 处理历史记录查询请求
- * 返回停车场的历史车辆记录，包括车牌号、车型、入场时间、出场时间和费用
- * 
- * @param req HTTP请求对象
- * @return HTTP响应对象
- * 
- * 处理流程：
- * 1. 获取停车场的历史车辆记录
- * 2. 构造记录数据的JSON数组表示
- * 3. 返回成功的HTTP响应
- */
 HttpResponse ParkingApiServer::handleGetHistory(const HttpRequest&) {
-    auto history = parkingLot->getHistoryVehicles();
-    std::ostringstream data;
-    data << "[";
-    for (size_t i = 0; i < history.size(); ++i) {
-        const auto& v = history[i];
-        data << "{\"plate\":\"" << v.getLicensePlate() << "\",";
-        data << "\"type\":\"" << v.getType() << "\",";
-        data << "\"entryTime\":" << v.getEntryTime() << ",";
-        data << "\"exitTime\":" << v.getExitTime() << ",";
-        data << "\"fee\":" << v.getFee() << "}";
-        if (i < history.size() - 1) {
-            data << ",";
+    try {
+        auto history = parkingLot->getHistoryVehicles();
+        
+        std::ostringstream data;
+        data << "[";
+        for (size_t i = 0; i < history.size(); ++i) {
+            const auto& vehicle = history[i];
+            if (i > 0) data << ",";
+            data << "{\"plate\":\"" << vehicle.getLicensePlate() << "\","
+                 << "\"type\":\"" << vehicle.getType() << "\","
+                 << "\"entryTime\":" << vehicle.getEntryTime() << ","
+                 << "\"exitTime\":" << vehicle.getExitTime() << ","
+                 << "\"fee\":" << vehicle.getFee() << "}";
         }
-    }
-    data << "]";
+        data << "]";
 
-    HttpResponse response;
-    response.body = createJsonResponse(true, "History retrieved", data.str());
-    return response;
+        HttpResponse response(200);
+        response.body = createJsonResponse(true, "History retrieved", data.str());
+        return response;
+    } catch (const std::exception& e) {
+        HttpResponse response(500);
+        response.body = createJsonResponse(false, std::string("Internal error: ") + e.what());
+        return response;
+    }
 }
 
-/**
- * @brief 处理当前在场车辆查询请求
- * 返回当前在停车场内的所有车辆信息，包括车牌号、车型、入场时间和每小时费率
- * 
- * @param req HTTP请求对象
- * @return HTTP响应对象
- * 
- * 处理流程：
- * 1. 获取当前在场车辆的列表
- * 2. 构造车辆信息的JSON数组表示
- * 3. 返回成功的HTTP响应
- * 
- * 边界情况处理：
- * - 当前没有车辆时返回空数组
- */
 HttpResponse ParkingApiServer::handleGetCurrentVehicles(const HttpRequest&) {
-    auto currentVehicles = parkingLot->getCurrentVehicles();
-    std::ostringstream data;
-    data << "[";
-    for (size_t i = 0; i < currentVehicles.size(); ++i) {
-        const auto& v = currentVehicles[i];
-        double hourlyRate = (v.getType() == "小型") ? parkingLot->getSmallRate() : parkingLot->getLargeRate();
-        data << "{\"plate\":\"" << v.getLicensePlate() << "\",";
-        data << "\"type\":\"" << v.getType() << "\",";
-        data << "\"entryTime\":" << v.getEntryTime() << ",";
-        data << "\"hourlyRate\":" << hourlyRate << "}";
-        if (i < currentVehicles.size() - 1) {
-            data << ",";
+    try {
+        auto vehicles = parkingLot->getCurrentVehicles();
+        
+        std::ostringstream data;
+        data << "[";
+        for (size_t i = 0; i < vehicles.size(); ++i) {
+            const auto& vehicle = vehicles[i];
+            if (i > 0) data << ",";
+            data << "{\"plate\":\"" << vehicle.getLicensePlate() << "\","
+                 << "\"type\":\"" << vehicle.getType() << "\","
+                 << "\"entryTime\":" << vehicle.getEntryTime() << ","
+                 << "\"hourlyRate\":" << (vehicle.getType() == "小型" ? 
+                                        parkingLot->getSmallRate() : 
+                                        parkingLot->getLargeRate()) << "}";
         }
-    }
-    data << "]";
+        data << "]";
 
-    HttpResponse response;
-    response.body = createJsonResponse(true, "Current vehicles retrieved", data.str());
-    return response;
+        HttpResponse response(200);
+        response.body = createJsonResponse(true, "Current vehicles retrieved", data.str());
+        return response;
+    } catch (const std::exception& e) {
+        HttpResponse response(500);
+        response.body = createJsonResponse(false, std::string("Internal error: ") + e.what());
+        return response;
+    }
 }
