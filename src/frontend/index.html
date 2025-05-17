@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>停车场管理系统</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>停车场管理系统</h1>
+            <div class="status-panel">
+                <div class="status-item">
+                    <span>可用车位：</span>
+                    <span id="available-spaces">100</span>
+                </div>
+                <div class="status-item">
+                    <span>小型车收费率：</span>
+                    <span id="small-rate">2</span> 元/小时
+                </div>
+                <div class="status-item">
+                    <span>大型车收费率：</span>
+                    <span id="large-rate">3</span> 元/小时
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <div class="control-panel">
+                <section>
+                    <h2>车辆入场</h2>
+                    <form id="entry-form">
+                        <div class="form-group">
+                            <label for="plate-number">车牌号：</label>
+                            <input type="text" id="plate-number" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="vehicle-type">车辆类型：</label>
+                            <select id="vehicle-type" required>
+                                <option value="小型">小型车</option>
+                                <option value="大型">大型车</option>
+                            </select>
+                        </div>
+                        <button type="submit">登记入场</button>
+                    </form>
+                </section>
+
+                <section>
+                    <h2>车辆出场</h2>
+                    <form id="exit-form">
+                        <div class="form-group">
+                            <label for="exit-plate">车牌号：</label>
+                            <input type="text" id="exit-plate" required>
+                        </div>
+                        <div id="vehicle-info"></div>
+                        <button type="submit">登记出场</button>
+                    </form>
+                </section>
+            </div>
+
+            <section>
+                <h2>停车记录</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>车牌号</th>
+                            <th>车辆类型</th>
+                            <th>入场时间</th>
+                            <th>出场时间</th>
+                            <th>费用（元）</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-body">
+                    </tbody>
+                </table>
+            </section>
+
+            <div class="current-vehicles-section">
+                <h3>当前在场车辆</h3>
+                <table class="vehicle-table">
+                    <thead>
+                        <tr>
+                            <th>车牌号</th>
+                            <th>车型</th>
+                            <th>入场时间</th>
+                            <th>当前费用</th>
+                        </tr>
+                    </thead>
+                    <tbody id="current-vehicles-body">
+                    </tbody>
+                </table>
+            </div>
+        </main>
+    </div>
+
+    <script src="js/config.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>
