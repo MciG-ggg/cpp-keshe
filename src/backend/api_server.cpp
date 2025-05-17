@@ -51,6 +51,7 @@ ParkingApiServer::ParkingApiServer(size_t capacity, double smallRate, double lar
     : parkingLot(std::make_unique<ParkingLot>(capacity, smallRate, largeRate))
     , serverSocket(-1)
     , running(false) {
+    initializeRoutes();  // 初始化路由表
 }
 
 // 获取文件的MIME类型
@@ -109,8 +110,8 @@ void ParkingApiServer::start(uint16_t port) {
 
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(port);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;  // 监听所有网络接口
+    serverAddr.sin_port = htons(port);        // 设置端口号
 
     if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
         close(serverSocket);
@@ -139,40 +140,7 @@ void ParkingApiServer::start(uint16_t port) {
         std::thread([this, clientSocket]() {
             try {
                 HttpRequest request = parseRequest(clientSocket);
-                HttpResponse response;
-
-                // Handle OPTIONS requests for CORS
-                if (request.method == "OPTIONS") {
-                    response.status = 204; // No Content
-                    response.headers["Access-Control-Allow-Origin"] = "*";
-                    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
-                    response.headers["Access-Control-Allow-Headers"] = "Content-Type";
-                }
-                // API请求处理
-                else if (request.path.find("/api/") == 0) {
-                    if (request.path == "/api/vehicle" && request.method == "POST") {
-                        response = handleAddVehicle(request);
-                    } else if (request.path.find("/api/vehicle/") == 0 && request.method == "DELETE") {
-                        response = handleRemoveVehicle(request);
-                    } else if (request.path.find("/api/vehicle/") == 0 && request.method == "GET") {
-                        response = handleQueryVehicle(request);
-                    } else if (request.path == "/api/status" && request.method == "GET") {
-                        response = handleGetParkingStatus(request);
-                    } else if (request.path == "/api/rate" && request.method == "PUT") {
-                        response = handleSetRate(request);
-                    } else if (request.path == "/api/history" && request.method == "GET") {
-                        response = handleGetHistory(request);
-                    } else if (request.path == "/api/current-vehicles" && request.method == "GET") {
-                        response = handleGetCurrentVehicles(request);
-                    } else {
-                        response.status = 404;
-                        response.body = createJsonResponse(false, "API endpoint not found");
-                    }
-                }
-                // 处理静态文件请求
-                else {
-                    response = handleStaticFile(request.path);
-                }
+                HttpResponse response = routeRequest(request);
 
                 sendResponse(clientSocket, response);
             } catch (const std::exception& e) {
@@ -191,6 +159,86 @@ void ParkingApiServer::stop() {
         close(serverSocket);
         serverSocket = -1;
     }
+}
+
+// 初始化路由表
+// 在这里配置所有的API路由规则
+void ParkingApiServer::initializeRoutes() {
+    // 路由表结构: {HTTP方法, URL路径, 处理函数, 是否使用前缀匹配}
+    routes = {
+        // 处理车辆入场请求 POST /api/vehicle
+        {"POST", "/api/vehicle", 
+         std::bind(&ParkingApiServer::handleAddVehicle, this, std::placeholders::_1), 
+         false},  // false表示精确匹配路径
+
+        // 处理车辆出场请求 DELETE /api/vehicle/{车牌号}
+        {"DELETE", "/api/vehicle/", 
+         std::bind(&ParkingApiServer::handleRemoveVehicle, this, std::placeholders::_1), 
+         true},   // true表示前缀匹配,因为后面还有动态参数(车牌号)
+
+        // 查询车辆信息 GET /api/vehicle/{车牌号}
+        {"GET", "/api/vehicle/", 
+         std::bind(&ParkingApiServer::handleQueryVehicle, this, std::placeholders::_1), 
+         true},   // 同样使用前缀匹配
+
+        // 获取停车场状态 GET /api/status
+        {"GET", "/api/status", 
+         std::bind(&ParkingApiServer::handleGetParkingStatus, this, std::placeholders::_1), 
+         false},
+
+        // 更新停车费率 PUT /api/rate
+        {"PUT", "/api/rate", 
+         std::bind(&ParkingApiServer::handleSetRate, this, std::placeholders::_1), 
+         false},
+
+        // 获取历史记录 GET /api/history
+        {"GET", "/api/history", 
+         std::bind(&ParkingApiServer::handleGetHistory, this, std::placeholders::_1), 
+         false},
+
+        // 获取当前在场车辆 GET /api/current-vehicles
+        {"GET", "/api/current-vehicles", 
+         std::bind(&ParkingApiServer::handleGetCurrentVehicles, this, std::placeholders::_1), 
+         false}
+    };
+}
+
+// 路由匹配和请求分发
+// @param request HTTP请求对象
+// @return HTTP响应对象
+HttpResponse ParkingApiServer::routeRequest(const HttpRequest& request) {
+    // 处理跨域预检请求(CORS preflight)
+    if (request.method == "OPTIONS") {
+        HttpResponse response(204);  // 204 No Content
+        // 设置CORS相关响应头
+        response.headers["Access-Control-Allow-Origin"] = "*";
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type";
+        return response;
+    }
+
+    // 处理API请求
+    if (request.path.find("/api/") == 0) {  // 检查是否是API请求(以/api/开头)
+        // 遍历路由表寻找匹配的处理函数
+        for (const auto& route : routes) {
+            // 根据路由配置决定使用精确匹配还是前缀匹配
+            bool matched = route.isPrefix ? 
+                         request.path.find(route.path) == 0 :  // 前缀匹配
+                         request.path == route.path;           // 精确匹配
+            
+            // 如果路径匹配且HTTP方法一致,调用对应的处理函数
+            if (matched && request.method == route.method) {
+                return route.handler(request);
+            }
+        }
+        // 未找到匹配的路由,返回404错误
+        HttpResponse response(404);
+        response.body = createJsonResponse(false, "API endpoint not found");
+        return response;
+    }
+
+    // 如果不是API请求,当作静态文件请求处理
+    return handleStaticFile(request.path);
 }
 
 HttpRequest ParkingApiServer::parseRequest(int clientSocket) {

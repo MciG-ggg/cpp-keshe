@@ -32,7 +32,7 @@ const ParkingAPI = {
      * @returns {Promise<Object>} 包含可用车位等信息
      */
     getParkingStatus() {
-        return this.request('/status');
+        return this.request('/api/status');
     },
 
     /**
@@ -42,7 +42,7 @@ const ParkingAPI = {
      * @returns {Promise<Object>} 入场结果
      */
     addVehicle(plate, type) {
-        return this.request('/enter', {
+        return this.request('/api/vehicle', {
             method: 'POST',
             body: JSON.stringify({ plate, type })
         });
@@ -54,9 +54,8 @@ const ParkingAPI = {
      * @returns {Promise<Object>} 包含停车费用等出场信息
      */
     removeVehicle(plate) {
-        return this.request('/exit', {
-            method: 'POST',
-            body: JSON.stringify({ plate })
+        return this.request(`/api/vehicle/${encodeURIComponent(plate)}`, {
+            method: 'DELETE'
         });
     },
 
@@ -65,7 +64,7 @@ const ParkingAPI = {
      * @returns {Promise<Object>} 包含所有已离场车辆的记录
      */
     getHistory() {
-        return this.request('/history');
+        return this.request('/api/history');
     },
 
     /**
@@ -73,6 +72,6 @@ const ParkingAPI = {
      * @returns {Promise<Object>} 包含所有在场车辆的信息
      */
     getCurrentVehicles() {
-        return this.request('/current');
+        return this.request('/api/current-vehicles');
     }
 };

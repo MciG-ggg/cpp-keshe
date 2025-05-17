@@ -6,6 +6,7 @@
 #include <functional>
 #include <sstream>
 #include <cstdint>
+#include <vector>
 
 class HttpRequest {
 public:
@@ -28,9 +29,24 @@ public:
 
 class ParkingApiServer {
 private:
+    // 定义路由处理器类型
+    using RouteHandler = std::function<HttpResponse(const HttpRequest&)>;
+    
+    // 定义路由表项结构
+    struct Route {
+        std::string method;
+        std::string path;
+        RouteHandler handler;
+        bool isPrefix;  // 是否是前缀匹配
+    };
+
+    std::vector<Route> routes;  // 路由表
     std::unique_ptr<ParkingLot> parkingLot;
     int serverSocket;
     bool running;
+
+    // 初始化路由表
+    void initializeRoutes();
 
     // API处理函数
     HttpResponse handleAddVehicle(const HttpRequest& req);
@@ -48,6 +64,9 @@ private:
     HttpRequest parseRequest(int clientSocket);
     void sendResponse(int clientSocket, const HttpResponse& response);
     std::string createJsonResponse(bool success, const std::string& message, const std::string& data = "");
+
+    // 路由匹配和分发
+    HttpResponse routeRequest(const HttpRequest& request);
 
 public:
     ParkingApiServer(size_t capacity = 100, double smallRate = 5.0, double largeRate = 8.0);
