@@ -97,26 +97,56 @@ std::string urlDecode(const std::string& encoded) {
 }
 
 /**
- * @brief ParkingApiServer构造函数
- * @param capacity 停车场容量
- * @param smallRate 小型车每小时费率
- * @param largeRate 大型车每小时费率
- * 
- * 初始化过程：
- * 1. 创建停车场管理对象
- * 2. 初始化服务器socket为-1（未创建）
- * 3. 设置运行状态为false
- * 4. 初始化路由表
- * 
- * 注意：
- * - 使用智能指针管理ParkingLot对象
- * - 构造函数不会创建socket或启动服务器
+ * @brief ThreadPool构造函数实现
  */
-ParkingApiServer::ParkingApiServer(size_t capacity, double smallRate, double largeRate) 
+ThreadPool::ThreadPool(size_t threads) : stop(false) {
+    for(size_t i = 0; i < threads; ++i) {
+        workers.emplace_back([this] {
+            while(true) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    condition.wait(lock, [this] {
+                        return stop || !tasks.empty();
+                    });
+                    
+                    if(stop && tasks.empty()) {
+                        return;
+                    }
+                    
+                    task = std::move(tasks.front());
+                    tasks.pop();
+                }
+                task();  // 执行任务
+            }
+        });
+    }
+}
+
+/**
+ * @brief ThreadPool析构函数实现
+ */
+ThreadPool::~ThreadPool() {
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        stop = true;
+    }
+    condition.notify_all();
+    for(auto& worker: workers) {
+        worker.join();
+    }
+}
+
+/**
+ * @brief ParkingApiServer构造函数实现
+ */
+ParkingApiServer::ParkingApiServer(size_t capacity, double smallRate, double largeRate)
     : parkingLot(std::make_unique<ParkingLot>(capacity, smallRate, largeRate))
     , serverSocket(-1)
-    , running(false) {
-    initializeRoutes();  // 初始化路由表
+    , running(false)
+    , threadPool(std::make_unique<ThreadPool>(std::thread::hardware_concurrency()))  // 使用CPU核心数
+    , activeConnections(0) {
+    initializeRoutes();
 }
 
 /**
@@ -261,35 +291,74 @@ void ParkingApiServer::start(uint16_t port) {
         throw std::runtime_error("Failed to listen on socket");
     }
 
-    // 5. 服务器主循环
     running = true;
-    std::cout << "Server started on port " << port << std::endl;
+    std::cout << "Server started on port " << port << " with " 
+              << std::thread::hardware_concurrency() << " worker threads." << std::endl;
 
     while (running) {
         sockaddr_in clientAddr{};
         socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
         
+        // 设置accept的超时，以便能够及时响应停止命令
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(serverSocket, &readSet);
+        
+        struct timeval timeout;
+        timeout.tv_sec = 1;  // 1秒超时
+        timeout.tv_usec = 0;
+        
+        int ready = select(serverSocket + 1, &readSet, nullptr, nullptr, &timeout);
+        if (ready < 0) {
+            if (errno == EINTR) continue;  // 被信号中断，继续循环
+            std::cerr << "Select error: " << strerror(errno) << std::endl;
+            break;
+        }
+        
+        if (ready == 0) continue;  // 超时，继续循环
+        
+        int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
         if (clientSocket < 0) {
             std::cerr << "Failed to accept connection" << std::endl;
             continue;
         }
 
-        // 创建新线程处理客户端请求
-        std::thread([this, clientSocket]() {
+        // 检查当前连接数是否超过限制
+        if (activeConnections.load() >= MAX_QUEUE_SIZE) {
+            std::cerr << "Too many connections, dropping new connection" << std::endl;
+            HttpResponse response(503);  // Service Unavailable
+            response.body = createJsonResponse(false, "Server is too busy, please try again later");
+            sendResponse(clientSocket, response);
+            close(clientSocket);
+            continue;
+        }
+
+        // 提交任务到线程池
+        threadPool->enqueue([this, clientSocket] {
+            activeConnections++;  // 增加活动连接计数
+            
             try {
-                // 解析请求并生成响应
+                // 设置socket读取超时
+                struct timeval tv;
+                tv.tv_sec = 5;  // 5秒超时
+                tv.tv_usec = 0;
+                setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                
+                // 处理请求
                 HttpRequest request = parseRequest(clientSocket);
                 HttpResponse response = routeRequest(request);
                 sendResponse(clientSocket, response);
+                
             } catch (const std::exception& e) {
-                // 处理请求过程中的任何异常
+                // 发送错误响应
                 HttpResponse errorResponse(500);
                 errorResponse.body = createJsonResponse(false, e.what());
                 sendResponse(clientSocket, errorResponse);
             }
-            close(clientSocket);  // 确保连接被关闭
-        }).detach();  // 分离线程，避免资源泄漏
+            
+            close(clientSocket);  // 确保关闭连接
+            activeConnections--;  // 减少活动连接计数
+        });
     }
 }
 
