@@ -1,20 +1,33 @@
+/**
+ * @file api_server.cpp
+ * @brief HTTP服务器实现，处理RESTful API请求和静态文件服务
+ * 
+ * 这个文件实现了一个基于Socket的HTTP服务器，支持：
+ * 1. RESTful API请求处理
+ * 2. 静态文件服务
+ * 3. 跨域资源共享(CORS)
+ * 4. 多线程并发处理
+ */
 #include "api_server.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
+#include <sys/socket.h>     // Socket API
+#include <netinet/in.h>     // 网络地址结构
+#include <unistd.h>         // Unix标准函数
 #include <cstring>
 #include <iostream>
-#include <thread>
+#include <thread>           // 多线程支持
 #include <sstream>
 #include <vector>
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
-#include <filesystem>
+#include <filesystem>       // C++17文件系统
 
 namespace fs = std::filesystem;
 
-// MIME类型映射
+/**
+ * @brief MIME类型映射表
+ * 用于设置HTTP响应的Content-Type头
+ */
 std::map<std::string, std::string> MIME_TYPES = {
     {".html", "text/html"},
     {".css", "text/css"},
@@ -26,7 +39,14 @@ std::map<std::string, std::string> MIME_TYPES = {
     {".ico", "image/x-icon"}
 };
 
-// URL decode function
+/**
+ * @brief URL解码函数
+ * 将URL编码的字符串转换为原始字符串
+ * 处理%XX格式的编码字符和+号(表示空格)
+ * 
+ * @param encoded URL编码的字符串
+ * @return 解码后的字符串
+ */
 std::string urlDecode(const std::string& encoded) {
     std::string result;
     for (size_t i = 0; i < encoded.length(); ++i) {
@@ -47,6 +67,14 @@ std::string urlDecode(const std::string& encoded) {
     return result;
 }
 
+/**
+ * @brief ParkingApiServer构造函数
+ * 初始化服务器实例和路由表
+ * 
+ * @param capacity 停车场容量
+ * @param smallRate 小型车每小时费率
+ * @param largeRate 大型车每小时费率
+ */
 ParkingApiServer::ParkingApiServer(size_t capacity, double smallRate, double largeRate) 
     : parkingLot(std::make_unique<ParkingLot>(capacity, smallRate, largeRate))
     , serverSocket(-1)
@@ -54,7 +82,13 @@ ParkingApiServer::ParkingApiServer(size_t capacity, double smallRate, double lar
     initializeRoutes();  // 初始化路由表
 }
 
-// 获取文件的MIME类型
+/**
+ * @brief 获取文件的MIME类型
+ * 根据文件扩展名确定Content-Type
+ * 
+ * @param path 文件路径
+ * @return MIME类型字符串
+ */
 std::string getMimeType(const std::string& path) {
     std::string ext = fs::path(path).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -62,7 +96,13 @@ std::string getMimeType(const std::string& path) {
     return it != MIME_TYPES.end() ? it->second : "application/octet-stream";
 }
 
-// 读取静态文件内容
+/**
+ * @brief 读取静态文件内容
+ * 将指定路径的文件内容读取到字符串中
+ * 
+ * @param path 文件路径
+ * @return 文件内容字符串
+ */
 std::string readFile(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
@@ -71,7 +111,13 @@ std::string readFile(const std::string& path) {
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
-// 处理静态文件请求
+/**
+ * @brief 处理静态文件请求
+ * 根据请求路径返回相应的静态文件内容
+ * 
+ * @param path 请求路径
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleStaticFile(const std::string& path) {
     std::string fullPath = "src/frontend" + (path == "/" ? "/index.html" : path);
     std::string content = readFile(fullPath);
@@ -92,10 +138,20 @@ HttpResponse ParkingApiServer::handleStaticFile(const std::string& path) {
     return response;
 }
 
+/**
+ * @brief ParkingApiServer析构函数
+ * 停止服务器并释放资源
+ */
 ParkingApiServer::~ParkingApiServer() {
     stop();
 }
 
+/**
+ * @brief 启动服务器
+ * 开始监听指定端口并接受客户端连接
+ * 
+ * @param port 监听的端口号
+ */
 void ParkingApiServer::start(uint16_t port) {
     serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket < 0) {
@@ -153,6 +209,10 @@ void ParkingApiServer::start(uint16_t port) {
     }
 }
 
+/**
+ * @brief 停止服务器
+ * 关闭监听的套接字并停止运行
+ */
 void ParkingApiServer::stop() {
     running = false;
     if (serverSocket >= 0) {
@@ -161,8 +221,10 @@ void ParkingApiServer::stop() {
     }
 }
 
-// 初始化路由表
-// 在这里配置所有的API路由规则
+/**
+ * @brief 初始化路由表
+ * 在这里配置所有的API路由规则
+ */
 void ParkingApiServer::initializeRoutes() {
     // 路由表结构: {HTTP方法, URL路径, 处理函数, 是否使用前缀匹配}
     routes = {
@@ -203,9 +265,13 @@ void ParkingApiServer::initializeRoutes() {
     };
 }
 
-// 路由匹配和请求分发
-// @param request HTTP请求对象
-// @return HTTP响应对象
+/**
+ * @brief 路由匹配和请求分发
+ * 根据请求的HTTP方法和路径匹配路由表，调用相应的处理函数
+ * 
+ * @param request HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::routeRequest(const HttpRequest& request) {
     // 处理跨域预检请求(CORS preflight)
     if (request.method == "OPTIONS") {
@@ -241,6 +307,13 @@ HttpResponse ParkingApiServer::routeRequest(const HttpRequest& request) {
     return handleStaticFile(request.path);
 }
 
+/**
+ * @brief 解析HTTP请求
+ * 从客户端套接字读取数据并解析成HTTP请求对象
+ * 
+ * @param clientSocket 客户端套接字
+ * @return 解析得到的HTTP请求对象
+ */
 HttpRequest ParkingApiServer::parseRequest(int clientSocket) {
     std::vector<char> buffer(4096);
     ssize_t bytesRead = recv(clientSocket, buffer.data(), buffer.size() - 1, 0);
@@ -305,6 +378,13 @@ HttpRequest ParkingApiServer::parseRequest(int clientSocket) {
     return request;
 }
 
+/**
+ * @brief 发送HTTP响应
+ * 将HTTP响应对象序列化并发送到客户端
+ * 
+ * @param clientSocket 客户端套接字
+ * @param response HTTP响应对象
+ */
 void ParkingApiServer::sendResponse(int clientSocket, const HttpResponse& response) {
     std::ostringstream responseStream;
     responseStream << "HTTP/1.1 " << response.status << " ";
@@ -341,6 +421,14 @@ void ParkingApiServer::sendResponse(int clientSocket, const HttpResponse& respon
     send(clientSocket, responseStr.c_str(), responseStr.length(), 0);
 }
 
+/**
+ * @brief 创建JSON格式的响应体
+ * 
+ * @param success 操作是否成功
+ * @param message 响应消息
+ * @param data 附加数据(可选)
+ * @return JSON字符串
+ */
 std::string ParkingApiServer::createJsonResponse(bool success, const std::string& message, const std::string& data) {
     std::ostringstream json;
     json << "{";
@@ -353,6 +441,13 @@ std::string ParkingApiServer::createJsonResponse(bool success, const std::string
     return json.str();
 }
 
+/**
+ * @brief 处理车辆入场请求
+ * 解析请求体中的车牌号和车型, 并将车辆信息添加到停车场
+ * 
+ * @param req HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleAddVehicle(const HttpRequest& req) {
     try {
         std::cout << "Received body: " << req.body << std::endl;
@@ -412,6 +507,13 @@ HttpResponse ParkingApiServer::handleAddVehicle(const HttpRequest& req) {
     }
 }
 
+/**
+ * @brief 处理车辆出场请求
+ * 根据车牌号移除停车场中的车辆信息，并返回车辆信息和费用
+ * 
+ * @param req HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleRemoveVehicle(const HttpRequest& req) {
     try {
         size_t pos = req.path.find_last_of('/');
@@ -447,6 +549,13 @@ HttpResponse ParkingApiServer::handleRemoveVehicle(const HttpRequest& req) {
     }
 }
 
+/**
+ * @brief 处理车辆查询请求
+ * 根据车牌号返回车辆的入场时间、出场时间和费用
+ * 
+ * @param req HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleQueryVehicle(const HttpRequest& req) {
     try {
         size_t pos = req.path.find_last_of('/');
@@ -482,6 +591,13 @@ HttpResponse ParkingApiServer::handleQueryVehicle(const HttpRequest& req) {
     }
 }
 
+/**
+ * @brief 处理停车场状态查询请求
+ * 返回当前停车场的空闲车位和占用车位数量
+ * 
+ * @param req HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleGetParkingStatus(const HttpRequest&) {
     std::ostringstream data;
     data << "{\"available\":" << parkingLot->getAvailableSpaces() << ",";
@@ -492,6 +608,13 @@ HttpResponse ParkingApiServer::handleGetParkingStatus(const HttpRequest&) {
     return response;
 }
 
+/**
+ * @brief 处理费率设置请求
+ * 更新小型车和大型车的每小时费率
+ * 
+ * @param req HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleSetRate(const HttpRequest& req) {
     try {
         std::cout << "Received rate update body: " << req.body << std::endl;
@@ -547,6 +670,13 @@ HttpResponse ParkingApiServer::handleSetRate(const HttpRequest& req) {
     }
 }
 
+/**
+ * @brief 处理历史记录查询请求
+ * 返回停车场的历史车辆记录，包括车牌号、车型、入场时间、出场时间和费用
+ * 
+ * @param req HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleGetHistory(const HttpRequest&) {
     auto history = parkingLot->getHistoryVehicles();
     std::ostringstream data;
@@ -569,6 +699,13 @@ HttpResponse ParkingApiServer::handleGetHistory(const HttpRequest&) {
     return response;
 }
 
+/**
+ * @brief 处理当前在场车辆查询请求
+ * 返回当前在停车场内的所有车辆信息，包括车牌号、车型、入场时间和每小时费率
+ * 
+ * @param req HTTP请求对象
+ * @return HTTP响应对象
+ */
 HttpResponse ParkingApiServer::handleGetCurrentVehicles(const HttpRequest&) {
     auto currentVehicles = parkingLot->getCurrentVehicles();
     std::ostringstream data;
