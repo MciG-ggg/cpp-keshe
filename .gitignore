@@ -8,15 +8,20 @@ parking_system
 # 忽略 obj 目录下的所有文件
 obj/
 
+# 忽略 build 目录
+build/
+
 # 忽略二进制数据文件
 *.dat
+
+# 忽略markdown文件
+*.md
 
 # 保留以下文件
 !CMakeLists.txt
 !Makefile
 !src/
 !README.md
-!项目技术文档.md
 
 # IDE和编辑器临时文件
 .vscode/
