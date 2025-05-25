@@ -2,7 +2,7 @@
  * @file vehicle.cpp
  * @brief Vehicle类的实现文件
  */
-#include "vehicle.h"
+#include "include/vehicle.h"
 
 Vehicle::Vehicle(const std::string& plate, const std::string& vType)
     : licensePlate(plate)     // 初始化车牌号
