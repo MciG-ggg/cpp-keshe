@@ -11,6 +11,9 @@ obj/
 # 忽略二进制数据文件
 *.dat
 
+# 忽略 Node.js 依赖目录
+node_modules/
+
 # 保留以下文件
 !CMakeLists.txt
 !Makefile
