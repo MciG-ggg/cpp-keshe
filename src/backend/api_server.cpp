@@ -62,16 +62,25 @@ std::map<std::string, std::string> MIME_TYPES = {
  * @param encoded URL编码的字符串
  * @return 解码后的原始字符串
  * 
- * 实现细节：
- * 1. 处理%XX格式的编码字符：
- *    - %后跟两位16进制数
- *    - 将16进制转换为对应的ASCII字符
- * 2. 处理+号：转换为空格
- * 3. 保留其他字符不变
+ * 功能描述：
+ * 将URL编码的字符串转换回原始字符串形式
+ * 
+ * 解码过程：
+ * 1. %XX格式处理：
+ *    - 识别%后跟随的两位16进制数
+ *    - 将16进制数转换为对应的ASCII字符
+ * 2. +号处理：
+ *    - 将+号转换为空格字符
+ * 3. 其他字符保持不变
  * 
  * 错误处理：
- * - 如果%后没有足够的字符，保持原样
- * - 如果16进制转换失败，保持原样
+ * - %后字符不足：保持原样
+ * - 非法16进制数：保持原样
+ * - 内存分配失败：抛出异常
+ * 
+ * 返回响应：
+ * - 成功：返回完整解码后的字符串
+ * - 失败：返回原始字符串或抛出异常
  */
 std::string urlDecode(const std::string& encoded) {
     std::string result;
@@ -434,6 +443,12 @@ ssize_t readWithTimeout(int clientSocket, char* buffer, size_t len, int timeout)
  * @brief 解析HTTP请求
  * @param clientSocket 客户端socket
  * @return 解析后的HTTP请求对象
+ * @example POST /api/vehicle HTTP/1.1
+            Host: localhost:8080
+            Content-Type: application/json
+            Content-Length: 45
+
+            {"plate":"京A12345","type":"小型"}
  */
 HttpRequest ParkingApiServer::parseRequest(int clientSocket) {
     const int TIMEOUT_SECONDS = 5;  // 读取超时时间
@@ -559,15 +574,35 @@ void ParkingApiServer::sendResponse(int clientSocket, const HttpResponse& respon
     responseStream << "HTTP/1.1 " << response.status << " ";
     
     switch (response.status) {
-        case 200: responseStream << "OK"; break;
-        case 204: responseStream << "No Content"; break;
-        case 400: responseStream << "Bad Request"; break;
-        case 404: responseStream << "Not Found"; break;
-        case 500: responseStream << "Internal Server Error"; break;
-        default: responseStream << "Unknown"; break;
+        case 200:
+            responseStream << "OK";
+            break;
+        case 201:
+            responseStream << "Created";
+            break;
+        case 204:
+            responseStream << "No Content";
+            break;
+        case 400:
+            responseStream << "Bad Request";
+            break;
+        case 401:
+            responseStream << "Unauthorized";
+            break;
+        case 403:
+            responseStream << "Forbidden";
+            break;
+        case 404:
+            responseStream << "Not Found";
+            break;
+        case 500:
+            responseStream << "Internal Server Error";
+            break;
+        default:
+            responseStream << "Unknown Status";
+            break;
     }
-    responseStream << "\r\n";
-
+    
     // Add CORS headers for all responses
     responseStream << "Access-Control-Allow-Origin: *\r\n";
     responseStream << "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n";
